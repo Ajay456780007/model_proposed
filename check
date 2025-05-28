@@ -1,0 +1,312 @@
+import torch
+import torch.nn as nn
+import math
+import torch.nn.functional as F
+from layer_HGNN import HGNN_conv
+print("enter inside sinusoidal embedding layer")
+class SinusoidalTimestepEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, timesteps):
+        device = timesteps.device
+        half_dim = self.dim // 2
+        emb = math.log(10000.0) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=torch.float32) * -emb)
+        emb = timesteps[:, None].float() * emb[None, :]
+        emb = torch.cat((torch.sin(emb), torch.cos(emb)), dim=-1)
+        return emb  # (B, dim)
+
+print("entering inside timestep embeddding")
+class TimestepEmbedder(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.embed = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(dim, dim)
+        )
+
+    def forward(self, t_embed):
+        return self.embed(t_embed)
+
+print("PositionalEncoding")
+class PositionalEncoding(nn.Module):
+    def __init__(self, dim, max_len=6000):
+        super().__init__()
+        pe = torch.zeros(max_len, dim, dtype=torch.float32)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * -(math.log(10000.0) / dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0), persistent=False)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+print("MultiHeadSelfAttention")
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, dim, heads=1, dropout=0.0):
+        super().__init__()
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = math.sqrt(self.head_dim)
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.out = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        B, N, C = x.size()
+        qkv = self.qkv(x).view(B, N, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = torch.softmax((q @ k.transpose(-2, -1)) / self.scale, dim=-1)
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, N, C)
+        return self.out(out)
+
+print("ff")
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.0):
+        super().__init__()
+        self.ff = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim)
+        )
+
+    def forward(self, x):
+        return self.ff(x)
+
+print("TB")
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, heads, hidden_dim):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = MultiHeadSelfAttention(dim, heads=heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = FeedForward(dim, hidden_dim)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
+        return x
+
+print("dit")
+class DiffusionTransformer(nn.Module):
+    def __init__(self, seq_len, dim=64, depth=1, heads=1, hidden_dim=128, num_classes=2):
+        super().__init__()
+        self.embedding = nn.Linear(4, dim)
+        self.pos_enc = PositionalEncoding(dim, max_len=seq_len)
+        self.timestep_embed = SinusoidalTimestepEmbedding(dim)
+        self.t_embed_proj = TimestepEmbedder(dim)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(dim, heads, hidden_dim) for _ in range(depth)
+        ])
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+
+    def forward(self, x, timesteps):
+        x = self.embedding(x.float())  # Ensure float32
+        x = self.pos_enc(x)
+        t_emb = self.t_embed_proj(self.timestep_embed(timesteps))  # (B, dim)
+        x = x + t_emb.unsqueeze(1)  # Add timestep
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = x.mean(dim=1)  # Global average pooling
+        return self.classifier(x)  # (B, num_classes)
+
+
+
+
+
+
+# Memory-efficient HGNN for 10x10 node graphs
+class DNA_HGNN(nn.Module):
+    def __init__(self, in_ch=4, hidden_ch=16, num_classes=2, dropout=0.1):
+        super(DNA_HGNN, self).__init__()
+        self.dropout = dropout
+        self.hgc1 = HGNN_conv(in_ch, hidden_ch)
+        self.hgc2 = HGNN_conv(hidden_ch, num_classes)
+
+    def forward(self, x, G):
+        """
+        x: Tensor (B, 10, F) — 10 nodes per sample
+        G: Tensor (B, 10, 10) — batch of 10x10 adjacency matrices
+        """
+
+        B, N, F = x.size()
+        out = []
+        for i in range(B):  # Process each graph separately to reduce memory
+            xi = x[i]
+            Gi = G[i]
+            xi = F.relu(self.hgc1(xi, Gi))
+            xi = F.dropout(xi, self.dropout, training=self.training)
+            xi = self.hgc2(xi, Gi)
+            out.append(xi)
+        return torch.stack(out, dim=0)  # (B, 10, num_classes)
+
+
+# Lightweight Attention Fusion
+class AttentionFusion(nn.Module):
+    def __init__(self, dim):
+        super(AttentionFusion, self).__init__()
+        self.weight_hgnn = nn.Parameter(torch.tensor(0.5))
+        self.weight_trans = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, hgnn_feat, trans_feat):
+        fused = self.weight_hgnn * hgnn_feat + self.weight_trans * trans_feat
+        return fused
+
+
+# Final Model
+class FusionGeneExpressionModel(nn.Module):
+    def __init__(self, seq_len, hgnn_in, hgnn_hidden, hgnn_classes,
+                 transformer_dim=64, fusion_dim=64, num_classes=2):
+        super(FusionGeneExpressionModel, self).__init__()
+
+        self.hgnn = DNA_HGNN(in_ch=hgnn_in, hidden_ch=hgnn_hidden, num_classes=hgnn_classes)
+        self.transformer = DiffusionTransformer(seq_len=seq_len, dim=transformer_dim, num_classes=num_classes)
+
+        self.hgnn_proj = nn.Linear(hgnn_classes, fusion_dim)
+        self.transformer_proj = nn.Linear(3, fusion_dim)
+
+        self.fusion = AttentionFusion(fusion_dim)
+        self.classifier = nn.Linear(fusion_dim, num_classes)
+
+    def forward(self, x_seq, x_graph, G, timesteps):
+        # Transformer feature
+        trans_feat = self.transformer(x_seq, timesteps)  # (B, transformer_dim)
+        trans_feat = self.transformer_proj(trans_feat)   # (B, fusion_dim)
+
+        # HGNN feature
+        hgnn_feat = self.hgnn(x_graph, G)                # (B, 10, hgnn_classes)
+        hgnn_feat = hgnn_feat.mean(dim=1)                # mean over nodes → (B, hgnn_classes)
+        hgnn_feat = self.hgnn_proj(hgnn_feat)            # (B, fusion_dim)
+
+        # Fuse and classify
+        fused = self.fusion(hgnn_feat, trans_feat)       # (B, fusion_dim)
+        return self.classifier(fused)                    # (B, num_classes)
+
+import numpy as np
+print("reading data")
+seq_data = np.load("data_loader/seq_int.npy")[:2000]
+labels=np.load("data_loader/label_categorical.npy")[:2000]
+graph_feat = seq_data.reshape((seq_data.shape[0], 10, -1))  # (N, 10, 2400)
+feature = graph_feat.shape[1]
+G = torch.eye(feature)
+from sklearn.metrics.pairwise import cosine_similarity
+G = cosine_similarity(graph_feat[0])  # shape: (10, 10)
+G = torch.tensor(G, dtype=torch.float32)
+
+print("Precomputing G_small...")
+precomputed_G = []
+import torch.nn.functional as F
+for i in range(len(graph_feat)):
+    g_feat = torch.tensor(graph_feat[i], dtype=torch.float32)
+    G = F.cosine_similarity(g_feat.unsqueeze(1), g_feat.unsqueeze(0), dim=-1)
+    precomputed_G.append(G)
+
+precomputed_G = torch.stack(precomputed_G)  # shape: (N, 10, 10)
+print("G_small precomputed.")
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+print("loading dataset")
+class GeneExpressionDataset(Dataset):
+    def __init__(self, seq_data, graph_feat, labels, G_all):
+        self.seq_data = seq_data
+        self.graph_feat = graph_feat
+        self.labels = labels
+        self.G_all = G_all
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        seq = torch.tensor(self.seq_data[idx], dtype=torch.float32)
+        graph_feat = torch.tensor(self.graph_feat[idx], dtype=torch.float32)
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        G_small = self.G_all[idx]  # precomputed
+
+        return seq, graph_feat, label, G_small
+
+
+
+
+
+from torch.utils.data import DataLoader
+print("dataloader")
+def collate_fn(batch):
+    seqs, graph_feats, labels, G_smalls = zip(*batch)
+    return (
+        torch.stack(seqs),        # (B, 6000, 4)
+        torch.stack(graph_feats),# (B, 10, 2400)
+        torch.tensor(labels),    # (B,)
+        torch.stack(G_smalls)    # (B, 10, 10)
+    )
+
+
+
+
+N = len(labels)
+
+# And each sample corresponds to 4 nodes, just an example:
+num_nodes_per_sample = 4
+
+# For simplicity, create dummy node indices for each sample, e.g., non-overlapping slices:
+
+
+train_dataset = GeneExpressionDataset(seq_data, graph_feat, labels, precomputed_G)
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
+
+
+print("final")
+model = FusionGeneExpressionModel(
+    seq_len=6000,
+    hgnn_in=graph_feat.shape[2],   # input features to HGNN (F)
+    hgnn_hidden=128,
+    hgnn_classes=128,
+    transformer_dim=128,
+    num_classes=3
+)
+
+print("entering to loop:")
+import torch.nn as nn
+import torch.optim as optim
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+for epoch in range(10):
+    model.train()
+    total_loss = 0
+    print(f"Epoch {epoch + 1} started")
+
+    for batch_idx, (x_seq, x_graph, y, G_small) in enumerate(train_loader):
+        print(f"Processing batch {batch_idx + 1}")
+        x_seq = x_seq.to(device)
+        x_graph = x_graph.to(device)
+        y = y.to(device)
+        G_small = G_small.to(device)  # pass the batch adjacency here!
+
+        optimizer.zero_grad()
+        print("Generating timesteps")
+        timesteps = torch.randint(0, 1000, (x_seq.size(0),), dtype=torch.long).to(device)
+        print("Calling model forward")
+        outputs = model(x_seq, x_graph, G_small, timesteps)
+        print("Forward done")
+        loss = criterion(outputs, y)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print(f"Epoch {epoch+1} | Loss: {total_loss / len(train_loader):.4f}")
